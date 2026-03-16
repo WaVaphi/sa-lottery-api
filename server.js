@@ -26,8 +26,21 @@ const path     = require('path');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── CORS: allow any origin (your hosted HTML file) ───
-app.use(cors());
+// ─── CORS: allow any origin including file:// (local HTML files) ───
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (file://, mobile apps, curl)
+    // and any http/https origin
+    callback(null, true);
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-update-token'],
+  credentials: false
+}));
+
+// Handle preflight OPTIONS requests explicitly
+app.options('*', cors());
+
 app.use(express.json());
 
 // ─── Data store ───────────────────────────────────────
