@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: sa-lottery-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: UPDATE_TOKEN
+        generateValue: true   # Render auto-generates a secure random token
+      - key: PORT
+        value: 3000
+    disk:
+      name: lottery-cache
+      mountPath: /opt/render/project/src
+      sizeGB: 1
