@@ -51,60 +51,28 @@ function saveCache() {
 }
 
 // ─── GAME URL MAP ────────────────────────────────────────
-// lottery.co.za has clean HTML tables — reliable source
+// lottery.co.za confirmed table structure:
+// | Draw Date | Draw Number | Results | Jackpot |
+// Results cell: "11  13  19  22  39  1" (space-separated, last = powerball for PB games)
 const GAME_URLS = [
-  {
-    gk: 'powerball',
-    name: 'POWERBALL',
-    url: 'https://www.lottery.co.za/powerball/results/',
-    pick: 5, pbPool: 20
-  },
-  {
-    gk: 'powerball-plus',
-    name: 'POWERBALL PLUS',
-    url: 'https://www.lottery.co.za/powerball-plus/results/',
-    pick: 5, pbPool: 20
-  },
-  {
-    gk: 'lotto',
-    name: 'LOTTO',
-    url: 'https://www.lottery.co.za/lotto/results/',
-    pick: 6, pbPool: null
-  },
-  {
-    gk: 'lotto-plus',
-    name: 'LOTTO PLUS 1',
-    url: 'https://www.lottery.co.za/lotto-plus-1/results/',
-    pick: 6, pbPool: null
-  },
-  {
-    gk: 'lotto-plus2',
-    name: 'LOTTO PLUS 2',
-    url: 'https://www.lottery.co.za/lotto-plus-2/results/',
-    pick: 6, pbPool: null
-  },
-  {
-    gk: 'daily',
-    name: 'DAILY LOTTO',
-    url: 'https://www.lottery.co.za/daily-lotto/results/',
-    pick: 5, pbPool: null
-  },
-  {
-    gk: 'daily-plus',
-    name: 'DAILY LOTTO PLUS',
-    url: 'https://www.lottery.co.za/daily-lotto-plus/results/',
-    pick: 5, pbPool: null
-  }
+  { gk:'powerball',      name:'POWERBALL',        baseUrl:'https://www.lottery.co.za/powerball/results',        pick:5, pbPool:20,   maxMain:50 },
+  { gk:'powerball-plus', name:'POWERBALL PLUS',   baseUrl:'https://www.lottery.co.za/powerball-plus/results',   pick:5, pbPool:20,   maxMain:50 },
+  { gk:'lotto',          name:'LOTTO',            baseUrl:'https://www.lottery.co.za/lotto/results',            pick:6, pbPool:null, maxMain:52 },
+  { gk:'lotto-plus',     name:'LOTTO PLUS 1',     baseUrl:'https://www.lottery.co.za/lotto-plus-1/results',     pick:6, pbPool:null, maxMain:52 },
+  { gk:'lotto-plus2',    name:'LOTTO PLUS 2',     baseUrl:'https://www.lottery.co.za/lotto-plus-2/results',     pick:6, pbPool:null, maxMain:52 },
+  { gk:'daily',          name:'DAILY LOTTO',      baseUrl:'https://www.lottery.co.za/daily-lotto/results',      pick:5, pbPool:null, maxMain:36 },
+  { gk:'daily-plus',     name:'DAILY LOTTO PLUS', baseUrl:'https://www.lottery.co.za/daily-lotto-plus/results', pick:5, pbPool:null, maxMain:36 }
 ];
 
 // ─── SCRAPER ─────────────────────────────────────────────
 async function scrapeGame(game, year) {
-  const url = `${game.url}${year}/`;
+  // Confirmed URL format: /powerball/results/2026 (no trailing slash)
+  const url = `${game.baseUrl}/${year}`;
   try {
     const res = await axios.get(url, {
       timeout: 20000,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-ZA,en;q=0.9',
         'Referer': 'https://www.lottery.co.za/'
@@ -114,41 +82,54 @@ async function scrapeGame(game, year) {
     const $ = cheerio.load(res.data);
     const results = [];
 
-    // lottery.co.za uses a clean <table> with columns:
-    // Draw Date | Draw Number | Results | Jackpot
+    // Confirmed table structure from live inspection:
+    // <table> with rows: Draw Date | Draw Number | Results | Jackpot
+    // Results cell contains numbers separated by whitespace
+    // e.g. "11  13  19  22  39  1" — for PB games last number is the Powerball
     $('table tr').each((i, row) => {
-      if (i === 0) return; // skip header
+      if (i === 0) return; // skip header row
 
       const cells = $(row).find('td');
       if (cells.length < 3) return;
 
-      const dateText = $(cells[0]).text().trim();
+      const dateText    = $(cells[0]).text().trim();
       const resultsText = $(cells[2]).text().trim();
       const jackpotText = cells.length >= 4 ? $(cells[3]).text().trim() : '';
 
-      // Parse date — format: "Tuesday, 24 March 2026"
       const date = parseDate(dateText);
       if (!date) return;
 
-      // Parse ball numbers from results cell
-      // Format: "11  13  19  22  39  1" (space-separated, last = powerball if PB game)
-      const nums = resultsText.split(/\s+/).map(n => parseInt(n)).filter(n => !isNaN(n) && n >= 1);
-      if (nums.length < game.pick) return;
+      // Split result numbers — handles multiple spaces between numbers
+      const nums = resultsText
+        .split(/\s+/)
+        .map(n => parseInt(n.trim()))
+        .filter(n => !isNaN(n) && n >= 1 && n <= 100);
 
-      const balls = nums.slice(0, game.pick);
+      // Need at least pick count numbers
+      const totalExpected = game.pick + (game.pbPool ? 1 : 0);
+      if (nums.length < game.pick) {
+        console.log(`[Parse] ${game.name} ${date}: only ${nums.length} numbers, expected ${totalExpected} — skipping`);
+        return;
+      }
+
+      const balls     = nums.slice(0, game.pick);
       const powerball = game.pbPool ? (nums[game.pick] || null) : null;
 
-      // Validate
-      if (balls.some(b => b < 1 || b > (game.pbPool ? 50 : game.gk.includes('daily') ? 36 : 52))) return;
-      if (new Set(balls).size !== balls.length) return;
-      if (powerball !== null && (powerball < 1 || powerball > game.pbPool)) return;
+      // Validate ranges
+      if (balls.some(b => b < 1 || b > game.maxMain)) {
+        console.log(`[Parse] ${game.name} ${date}: ball out of range [${balls}]`);
+        return;
+      }
+      if (new Set(balls).size !== balls.length) {
+        console.log(`[Parse] ${game.name} ${date}: duplicate balls [${balls}]`);
+        return;
+      }
+      if (powerball !== null && (powerball < 1 || powerball > game.pbPool)) {
+        console.log(`[Parse] ${game.name} ${date}: PB ${powerball} out of range`);
+        return;
+      }
 
-      // Parse jackpot amount
       const jackpot = parseJackpot(jackpotText);
-
-      // Detect jackpot won: if jackpot is present and there's no "rollover" indicator,
-      // we infer from the sequence — jackpot resets to base if next draw is much lower
-      // We'll handle this in post-processing
 
       results.push({
         date,
@@ -162,9 +143,11 @@ async function scrapeGame(game, year) {
       });
     });
 
+    console.log(`[Scraper] ${game.name} ${year}: parsed ${results.length} draws from ${url}`);
     return results;
+
   } catch(e) {
-    console.error(`[Scraper] Failed ${game.name} ${year}:`, e.message);
+    console.error(`[Scraper] Failed ${game.name} ${year} (${url}):`, e.message);
     return [];
   }
 }
