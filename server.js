@@ -53,18 +53,99 @@ function saveCache() {
 // ─── GAME URL MAP ────────────────────────────────────────
 // lottery.co.za confirmed table structure:
 // | Draw Date | Draw Number | Results | Jackpot |
-// Results cell: "11  13  19  22  39  1" (space-separated, last = powerball for PB games)
+// NB: SA Lotto changed from 6/52 to 6/58 on 21 September 2025
+// NB: za.national-lottery.com has an "Outcome" column (Roll/Won) — use that for jackpot detection
 const GAME_URLS = [
   { gk:'powerball',      name:'POWERBALL',        baseUrl:'https://www.lottery.co.za/powerball/results',        pick:5, pbPool:20,   maxMain:50 },
   { gk:'powerball-plus', name:'POWERBALL PLUS',   baseUrl:'https://www.lottery.co.za/powerball-plus/results',   pick:5, pbPool:20,   maxMain:50 },
-  { gk:'lotto',          name:'LOTTO',            baseUrl:'https://www.lottery.co.za/lotto/results',            pick:6, pbPool:null, maxMain:52 },
-  { gk:'lotto-plus',     name:'LOTTO PLUS 1',     baseUrl:'https://www.lottery.co.za/lotto-plus-1/results',     pick:6, pbPool:null, maxMain:52 },
-  { gk:'lotto-plus2',    name:'LOTTO PLUS 2',     baseUrl:'https://www.lottery.co.za/lotto-plus-2/results',     pick:6, pbPool:null, maxMain:52 },
+  { gk:'lotto',          name:'LOTTO',            baseUrl:'https://www.lottery.co.za/lotto/results',            pick:6, pbPool:null, maxMain:58 },
+  { gk:'lotto-plus',     name:'LOTTO PLUS 1',     baseUrl:'https://www.lottery.co.za/lotto-plus-1/results',     pick:6, pbPool:null, maxMain:58 },
+  { gk:'lotto-plus2',    name:'LOTTO PLUS 2',     baseUrl:'https://www.lottery.co.za/lotto-plus-2/results',     pick:6, pbPool:null, maxMain:58 },
   { gk:'daily',          name:'DAILY LOTTO',      baseUrl:'https://www.lottery.co.za/daily-lotto/results',      pick:5, pbPool:null, maxMain:36 },
   { gk:'daily-plus',     name:'DAILY LOTTO PLUS', baseUrl:'https://www.lottery.co.za/daily-lotto-plus/results', pick:5, pbPool:null, maxMain:36 }
 ];
 
-// ─── SCRAPER ─────────────────────────────────────────────
+// ─── SECONDARY SOURCE — za.national-lottery.com ──────────
+// This site has an explicit "Outcome" column (Roll/Won)
+// which gives us definitive jackpot won detection
+const NL_URLS = [
+  { gk:'lotto',       url:'https://za.national-lottery.com/lotto/results/{year}-archive',       pick:6, maxMain:58 },
+  { gk:'lotto-plus',  url:'https://za.national-lottery.com/lotto-plus-1/results/{year}-archive',pick:6, maxMain:58 },
+  { gk:'lotto-plus2', url:'https://za.national-lottery.com/lotto-plus-2/results/{year}-archive',pick:6, maxMain:58 },
+];
+
+async function scrapeNationalLottery(game, year) {
+  const url = game.url.replace('{year}', year);
+  try {
+    const res = await axios.get(url, {
+      timeout: 20000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Referer': 'https://za.national-lottery.com/'
+      }
+    });
+    const $ = cheerio.load(res.data);
+    const results = [];
+
+    // Table: Draw Date | Results | Jackpot | Outcome
+    $('table tr').each((i, row) => {
+      if (i === 0) return;
+      const cells = $(row).find('td');
+      if (cells.length < 3) return;
+
+      const dateText    = $(cells[0]).text().trim();
+      const resultsText = $(cells[1]).text().trim();
+      const jackpotText = cells.length >= 3 ? $(cells[2]).text().trim() : '';
+      const outcomeText = cells.length >= 4 ? $(cells[3]).text().trim().toLowerCase() : '';
+
+      const date = parseDate(dateText);
+      if (!date) return;
+
+      // Extract ball numbers — results cell contains list items or space-separated nums
+      const nums = [];
+      $(cells[1]).find('li').each((_,li) => {
+        const n = parseInt($(li).text().trim());
+        if (!isNaN(n)) nums.push(n);
+      });
+      // Fallback: parse from text
+      if (nums.length === 0) {
+        resultsText.split(/\s+/).forEach(s => {
+          const n = parseInt(s);
+          if (!isNaN(n) && n >= 1) nums.push(n);
+        });
+      }
+
+      if (nums.length < game.pick) return;
+
+      // First 'pick' numbers = main balls, next = bonus ball
+      const balls  = nums.slice(0, game.pick);
+      const bonus  = nums.length > game.pick ? nums[game.pick] : null;
+
+      if (balls.some(b => b < 1 || b > game.maxMain)) return;
+      if (new Set(balls).size !== balls.length) return;
+
+      // Outcome column gives us definitive jackpot won status
+      const jackpotWon = outcomeText.includes('won') || outcomeText.includes('win');
+      const jackpot = parseJackpot(jackpotText);
+
+      results.push({
+        date, game: game.gk, balls,
+        bonus: null,  // lotto bonus not player-selected
+        powerball: null,
+        jackpotWon,
+        jackpot,
+        source: 'national-lottery.com'
+      });
+    });
+
+    console.log(`[NL Scraper] ${game.gk} ${year}: ${results.length} draws from ${url}`);
+    return results;
+  } catch(e) {
+    console.error(`[NL Scraper] Failed ${game.gk} ${year}:`, e.message);
+    return [];
+  }
+}
 async function scrapeGame(game, year) {
   // Confirmed URL format: /powerball/results/2026 (no trailing slash)
   const url = `${game.baseUrl}/${year}`;
@@ -242,23 +323,49 @@ async function runUpdate() {
   const currentYear = new Date().getFullYear();
   const allNew = [];
 
-  for (const game of GAME_URLS) {
-    // Scrape current year + previous year for initial load
-    const years = cache.draws.length === 0
+  // Use national-lottery.com for Lotto games (has outcome column + 1-58 range)
+  for (const game of NL_URLS) {
+    const years = cache.draws.filter(d=>d.game===game.gk).length === 0
       ? [currentYear - 1, currentYear]
       : [currentYear];
-
     for (const year of years) {
-      const results = await scrapeGame(game, year);
-      console.log(`[Scraper] ${game.name} ${year}: ${results.length} draws`);
+      const results = await scrapeNationalLottery(game, year);
       allNew.push(...results);
-      await sleep(1200); // polite delay
+      await sleep(1200);
     }
   }
 
-  const resolved = resolveJackpotWon(allNew);
-  const added = mergeDraws(resolved);
+  // Use lottery.co.za for all other games
+  const otherGames = GAME_URLS.filter(g => !['lotto','lotto-plus','lotto-plus2'].includes(g.gk));
+  for (const game of otherGames) {
+    const years = cache.draws.filter(d=>d.game===game.gk).length === 0
+      ? [currentYear - 1, currentYear]
+      : [currentYear];
+    for (const year of years) {
+      const results = await scrapeGame(game, year);
+      allNew.push(...results);
+      await sleep(1200);
+    }
+  }
 
+  // For Lotto games, remove old draws with wrong ball range (pre-fix stale data)
+  // Any Lotto draw after Sep 21 2025 that has balls <= 52 max should be re-evaluated
+  // We simply allow the new scrape to overwrite via the merge (same date+game key = skip)
+  // But we must purge stale entries that were rejected with wrong maxMain
+  const staleLottoDates = new Set(
+    allNew.filter(d=>['lotto','lotto-plus','lotto-plus2'].includes(d.game)).map(d=>d.date)
+  );
+  // Remove cached lotto draws that are being re-scraped
+  cache.draws = cache.draws.filter(d =>
+    !['lotto','lotto-plus','lotto-plus2'].includes(d.game) || !staleLottoDates.has(d.date)
+  );
+
+  // For non-Lotto games, apply jackpot won resolution
+  const nonLotto = allNew.filter(d=>!['lotto','lotto-plus','lotto-plus2'].includes(d.game));
+  const lottoNew = allNew.filter(d=>['lotto','lotto-plus','lotto-plus2'].includes(d.game));
+  const resolvedNonLotto = resolveJackpotWon(nonLotto);
+
+  const added = mergeDraws([...lottoNew, ...resolvedNonLotto]);
   if (added > 0) saveCache();
 
   console.log(`[Update] Done. Added ${added}. Total: ${cache.draws.length}`);
